@@ -25,46 +25,69 @@ def verify_extract(path, expected_sha, destination):
     with path.open("rb") as stream:
         if hashlib.file_digest(stream, "sha256").hexdigest() != expected_sha:
             raise ValueError("Archive hash mismatch")
-    with tarfile.open(path, "r:gz") as archive:
-        members = archive.getmembers()
-        names = [m.name for m in members]
-        if len(names) != len(set(names)) or any(not m.isfile() for m in members):
-            raise ValueError("Duplicate members, directories and links are forbidden")
-        receipt_file = archive.getmember("release.json")
-        if receipt_file.size > 10 * 1024 ** 2:
+    # Gzip random access repeatedly inflates the preceding archive. Use two
+    # sequential passes so validation remains linear in the archive size.
+    with tarfile.open(path, "r|gz") as archive:
+        receipt_file = next(iter(archive))
+        if receipt_file.name != "release.json" or not receipt_file.isfile() or receipt_file.size > 10 * 1024 ** 2:
             raise ValueError("Oversized release receipt")
         receipt = json.load(archive.extractfile(receipt_file))
         if receipt.get("platform") != "github-pages" or receipt.get("schema") != 1:
             raise ValueError("Expected a GitHub Pages release")
         proofs = receipt["files"]
-        if set(names) != {"release.json", *("site/" + n for n in proofs)}:
-            raise ValueError("Unexpected archive contents")
         if not {"index.html", ".nojekyll", "data/manifest.json"} <= set(proofs):
             raise ValueError("Missing public entrypoints")
-        if sum(m.size for m in members) > 1000 ** 3:
+        if any(not public_name(n) or type(p.get("bytes")) is not int or p["bytes"] < 0 for n, p in proofs.items()):
+            raise ValueError("Invalid public member")
+        if sum(p["bytes"] for p in proofs.values()) + receipt_file.size > 1000 ** 3:
             raise ValueError("Published site exceeds 1 GB")
-        for name, proof in proofs.items():
-            member = archive.getmember("site/" + name)
-            if not public_name(name) or member.size != proof["bytes"]:
+        seen = {"release.json"}
+        for member in archive:
+            # TarFile's iterator yields its first member again after next().
+            if member is receipt_file:
+                continue
+            if member.name in seen or not member.isfile():
+                raise ValueError("Duplicate members, directories and links are forbidden")
+            seen.add(member.name)
+            name = member.name.removeprefix("site/")
+            proof = proofs.get(name)
+            if not member.name.startswith("site/") or proof is None or member.size != proof["bytes"]:
                 raise ValueError("Invalid public member: " + name)
             with archive.extractfile(member) as stream:
-                if hashlib.file_digest(stream, "sha256").hexdigest() != proof["sha256"]:
-                    raise ValueError("Member checksum mismatch: " + name)
+                payload = stream.read()
+            if hashlib.sha256(payload).hexdigest() != proof["sha256"]:
+                raise ValueError("Member checksum mismatch: " + name)
             if name.endswith(".json"):
-                value = json.load(archive.extractfile(member))
+                value = json.loads(payload)
                 expected_build = name.split("/")[2] if name.startswith("data/builds/") else receipt["build_id"]
                 if value.get("build_id") != expected_build:
                     raise ValueError("Mixed build versions: " + name)
-        if archive.extractfile("site/.nojekyll").read() != b"":
-            raise ValueError("Invalid .nojekyll marker")
-        # Extract only verified names; never invoke extractall on incoming files.
-        destination.mkdir(parents=True)
-        for name in proofs:
+            if name == ".nojekyll" and payload != b"":
+                raise ValueError("Invalid .nojekyll marker")
+        if seen != {"release.json", *("site/" + n for n in proofs)}:
+            raise ValueError("Unexpected archive contents")
+    # Extract only verified names; never invoke extractall on incoming files.
+    destination.mkdir(parents=True)
+    with tarfile.open(path, "r|gz") as archive:
+        extracted = set()
+        for member in archive:
+            if member.name == "release.json":
+                continue
+            name = member.name.removeprefix("site/")
+            if not member.isfile() or name not in proofs or name in extracted or member.name != "site/" + name:
+                raise ValueError("Archive changed after validation")
+            extracted.add(name)
             target = destination / name
             target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.extractfile("site/" + name) as source, target.open("xb") as output:
+            checksum = hashlib.sha256()
+            with archive.extractfile(member) as source, target.open("xb") as output:
                 while chunk := source.read(1024 ** 2):
                     output.write(chunk)
+                    checksum.update(chunk)
+            if target.stat().st_size != proofs[name]["bytes"] or checksum.hexdigest() != proofs[name]["sha256"]:
+                raise ValueError("Archive changed after validation")
+        if extracted != set(proofs):
+            raise ValueError("Archive changed after validation")
     print(json.dumps({"verified_build_id": receipt["build_id"], "files": len(proofs)}))
 
 
