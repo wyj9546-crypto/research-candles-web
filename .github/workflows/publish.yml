@@ -1,6 +1,8 @@
 name: Publish verified research website
 
 on:
+  push:
+    branches: [hosting]
   workflow_dispatch:
     inputs:
       release_tag:
@@ -23,6 +25,7 @@ concurrency:
 
 jobs:
   publish:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment:
