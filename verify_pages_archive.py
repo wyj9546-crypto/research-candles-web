@@ -1,4 +1,6 @@
 """Validate a sealed public archive before extracting it for GitHub Pages."""
+import gzip
+import io
 import hashlib
 import json
 import re
@@ -13,7 +15,7 @@ def public_name(name):
         return False
     return (name in {"index.html", ".nojekyll", "data/manifest.json", "data/status.json"}
             or name.startswith("assets/") and p.suffix in {".js", ".css", ".svg", ".png", ".jpg", ".webp", ".ico", ".woff", ".woff2"}
-            or re.fullmatch(r"data/builds/[a-f0-9]{16}/.+\.json", name) is not None)
+            or re.fullmatch(r"data/builds/[a-f0-9]{16}/.+\.json(?:\.gz)?", name) is not None)
 
 
 def verify_extract(path, expected_sha, destination):
@@ -57,7 +59,12 @@ def verify_extract(path, expected_sha, destination):
                 payload = stream.read()
             if hashlib.sha256(payload).hexdigest() != proof["sha256"]:
                 raise ValueError("Member checksum mismatch: " + name)
-            if name.endswith(".json"):
+            if name.endswith((".json", ".json.gz")):
+                if name.endswith('.gz'):
+                    with gzip.GzipFile(fileobj=io.BytesIO(payload)) as compressed:
+                        payload = compressed.read(128 * 1024 ** 2 + 1)
+                if len(payload) > 128 * 1024 ** 2:
+                    raise ValueError('Oversized JSON shard')
                 value = json.loads(payload)
                 expected_build = name.split("/")[2] if name.startswith("data/builds/") else receipt["build_id"]
                 if value.get("build_id") != expected_build:
